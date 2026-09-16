@@ -292,22 +292,18 @@ mod tests {
             ..CodexModelUsage::default()
         };
 
-        let reserve_cost = calculate_codex_model_cost(
-            "gpt-reserve",
-            &usage,
-            &pricing,
-            CodexSpeed::Standard,
-        );
-        let luna_cost = calculate_codex_model_cost(
-            "gpt-5.6-luna",
-            &usage,
-            &pricing,
-            CodexSpeed::Standard,
-        );
+        let reserve_cost =
+            calculate_codex_model_cost("gpt-reserve", &usage, &pricing, CodexSpeed::Standard);
+        let luna_cost =
+            calculate_codex_model_cost("gpt-5.6-luna", &usage, &pricing, CodexSpeed::Standard);
 
         assert!(reserve_cost > 0.0);
         assert_eq!(reserve_cost, luna_cost);
-        assert!(!codex_model_missing_pricing("gpt-reserve", &usage, &pricing));
+        assert!(!codex_model_missing_pricing(
+            "gpt-reserve",
+            &usage,
+            &pricing
+        ));
     }
 
     #[test]
