@@ -2522,6 +2522,7 @@ fn model_without_date_suffix(model: &str) -> &str {
 /// Maps model aliases to canonical pricing keys before fuzzy matching.
 fn pricing_alias(model: &str) -> Option<&'static str> {
     match model {
+        "gpt-reserve" => Some("gpt-5.6-luna"),
         "gpt-5.6" => Some("gpt-5.6-sol"),
         "gpt-5.3-spark" => Some("gpt-5.3-codex-spark"),
         _ => None,
@@ -4771,6 +4772,26 @@ mod tests {
         assert_eq!(short_spark.output, codex_spark.output);
         assert_eq!(short_spark.cache_read, codex_spark.cache_read);
         assert_eq!(short_spark.fast_multiplier, codex_spark.fast_multiplier);
+    }
+
+    #[test]
+    fn embedded_pricing_resolves_codex_gpt_reserve_to_gpt_5_6_luna() {
+        let pricing = PricingMap::load_embedded();
+        let reserve = pricing
+            .find("gpt-reserve")
+            .expect("gpt-reserve should resolve via model alias");
+        let luna = pricing
+            .find("gpt-5.6-luna")
+            .expect("GPT-5.6 Luna pricing should exist");
+
+        assert_eq!(reserve.input, luna.input);
+        assert_eq!(reserve.output, luna.output);
+        assert_eq!(reserve.cache_read, luna.cache_read);
+        assert_eq!(reserve.fast_multiplier, luna.fast_multiplier);
+        assert_eq!(
+            long_context_split_threshold("gpt-reserve"),
+            long_context_split_threshold("gpt-5.6-luna")
+        );
     }
 
     #[test]
