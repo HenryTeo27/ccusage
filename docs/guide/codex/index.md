@@ -25,6 +25,12 @@ Most users can start with unified reports such as `ccusage daily`. Add the `code
 
 The CLI reads Codex session JSONL files located under `CODEX_HOME` (defaults to `~/.codex`). `CODEX_HOME` can be one directory or a comma-separated list of directories. For each entry, ccusage discovers `sessions/` and `archived_sessions/` independently, so an entry with only `archived_sessions/` still contributes archived Codex logs. When neither directory exists, the entry is read directly as a JSONL directory, which lets saved `codex exec --json` output live beside normal Codex homes. If the same relative JSONL path exists in both `sessions/` and `archived_sessions/` for one Codex home, the active `sessions/` copy wins so archived copies are not double counted.
 
+### Local Logs vs. Codex Account Totals
+
+Codex reports are reconstructed from token events in the local session files above; ccusage does not query or reconcile Codex's account-level usage service. The Codex App Server exposes separate account-wide lifetime and daily totals through [`account/usage/read`](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs) ([method declaration](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/common.rs)). These account-wide fields are aggregate totals, not a per-model breakdown, so they cannot be used to assign a difference to a local model row. The account profile and a report reconstructed from retained local logs can therefore differ when their source coverage or accounting boundaries differ.
+
+The `--timezone` option controls how ccusage groups local event timestamps; it does not change or reconcile account-level buckets. The App Server protocol exposes each daily bucket's `startDate` but does not specify its timezone, so do not assume that a local timezone setting exactly matches the account's day boundary.
+
 ```bash
 CODEX_HOME="$HOME/.codex,$HOME/.codex-work,$HOME/codex-exec-logs" ccusage codex daily
 ```
@@ -61,7 +67,7 @@ These views support `--json`, `--compact`, `--offline`, and `--speed auto|standa
 | `CODEX_HOME` | Override the root directory, or comma-separated directories, containing Codex homes or saved `codex exec --json` JSONL files |
 | `LOG_LEVEL`  | Adjust log verbosity (0 silent … 5 trace)                                                                                    |
 
-When Codex emits a model alias, the CLI automatically resolves it through the LiteLLM pricing data when possible. The built-in `gpt-reserve` alias is priced as `gpt-5.6-luna`. Codex logs retain `codex-auto-review` as a routing alias rather than recording its effective model, so ccusage applies a manually curated, best-effort timeline and marks the result with `"isFallback": true`. Based on OpenAI's [July 30, 2026 Auto-review migration announcement](https://community.openai.com/t/announcing-a-major-price-drop-for-5-6-terra-and-luna-and-fast-mode-for-5-6-sol/1388484), records from that date onward resolve to `gpt-5.6-luna`, while records from March 5 through July 29 resolve to `gpt-5.4`. Server-side routing or catalog overrides can still differ from this estimate.
+When Codex emits a model alias, the CLI automatically resolves it through the LiteLLM pricing data when possible. The built-in `gpt-reserve` alias is priced as `gpt-5.6-luna`; this is a pricing lookup only and does not add, remove, or change token totals. If a local log records only the Reserve alias, ccusage cannot infer an unrecorded effective backend model, so its cost remains an estimate. Codex logs retain `codex-auto-review` as a routing alias rather than recording its effective model, so ccusage applies a manually curated, date-based best-effort timeline and marks the result with `"isFallback": true`. Based on OpenAI's [July 30, 2026 Auto-review migration announcement](https://community.openai.com/t/announcing-a-major-price-drop-for-5-6-terra-and-luna-and-fast-mode-for-5-6-sol/1388484), records from that date onward resolve to `gpt-5.6-luna`, while records from March 5 through July 29 resolve to `gpt-5.4`. Server-side routing or catalog overrides can still differ from this estimate.
 
 ## Speed Pricing
 
