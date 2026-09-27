@@ -39,6 +39,7 @@ pub const fn merge_codex_service_tiers(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexTokenUsageEvent {
     pub session_id: String,
+    pub response_id: Option<String>,
     pub timestamp: String,
     pub model: Option<String>,
     pub input_tokens: u64,
@@ -181,6 +182,12 @@ pub(super) struct CodexPayload<'a> {
     pub(super) model: Option<Cow<'a, str>>,
     #[serde(rename = "model_name", borrow, default)]
     pub(super) model_name: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub(super) response_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub(super) compaction_response_id: Option<Cow<'a, str>>,
+    #[serde(default, deserialize_with = "deserialize_optional_object_lossy")]
+    pub(super) usage: Option<CodexRawUsage>,
     #[serde(
         borrow,
         default,

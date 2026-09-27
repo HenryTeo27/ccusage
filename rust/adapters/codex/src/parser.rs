@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader},
     path::Path,
@@ -27,6 +28,10 @@ static TOKEN_COUNT_TYPE_FINDER: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new(br#""type":"token_count""#));
 static THREAD_SETTINGS_APPLIED_TYPE_FINDER: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new(br#""type":"thread_settings_applied""#));
+static TOKEN_USAGE_RECORD_TYPE_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""type":"token_usage_record""#));
+static COMPACTED_TYPE_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(br#""type":"compacted""#));
 static THREAD_SETTINGS_APPLIED_FINDER: LazyLock<Finder<'static>> =
     LazyLock::new(|| Finder::new(b"thread_settings_applied"));
 static COMPACT_TYPE_FIELD_FINDER: LazyLock<Finder<'static>> =
@@ -63,6 +68,13 @@ enum CodexLineKind {
 struct CodexExecTimestamps {
     event: String,
     model: String,
+}
+
+#[derive(Default)]
+struct CodexCompactionUsageState {
+    compacted_response_ids: HashSet<String>,
+    pending_usage: HashMap<String, CodexTokenUsageEvent>,
+    emitted_response_ids: HashSet<String>,
 }
 
 /// Tracks how far a forked session's leading events still match the history it
@@ -169,6 +181,7 @@ pub(super) fn visit_codex_session_file(
     let mut current_model: Option<String> = None;
     let mut current_model_is_fallback = false;
     let mut current_service_tier = None;
+    let mut compaction_usage = CodexCompactionUsageState::default();
     let fallback_timestamp = file_modified_timestamp(path);
     let mut replay = match replayed_prefix {
         Some(prefix) => CodexReplayState::MatchingParent { prefix, index: 0 },
@@ -244,6 +257,7 @@ pub(super) fn visit_codex_session_file(
                     &mut current_model,
                     &mut current_model_is_fallback,
                     &mut current_service_tier,
+                    &mut compaction_usage,
                     &mut visit_filtered,
                 )?;
             }
@@ -281,9 +295,101 @@ fn visit_codex_session_entry(
     current_model: &mut Option<String>,
     current_model_is_fallback: &mut bool,
     current_service_tier: &mut Option<CodexServiceTier>,
+    compaction_usage: &mut CodexCompactionUsageState,
     visit: &mut impl FnMut(CodexTokenUsageEvent) -> Result<()>,
 ) -> Result<()> {
     let entry_type = value.entry_type.as_deref();
+    if entry_type == Some("compacted") {
+        let Some(response_id) = value
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.compaction_response_id.as_deref())
+            .map(str::trim)
+            .filter(|response_id| !response_id.is_empty())
+        else {
+            return Ok(());
+        };
+        let response_id = response_id.to_string();
+        compaction_usage
+            .compacted_response_ids
+            .insert(response_id.clone());
+        if let Some(event) = compaction_usage.pending_usage.remove(&response_id)
+            && compaction_usage.emitted_response_ids.insert(response_id)
+        {
+            visit(event)?;
+        }
+        return Ok(());
+    }
+    if entry_type == Some("token_usage_record") {
+        let Some(payload) = value.payload.as_ref() else {
+            return Ok(());
+        };
+        let Some(response_id) = payload
+            .response_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|response_id| !response_id.is_empty())
+        else {
+            return Ok(());
+        };
+        let response_id = response_id.to_string();
+        if compaction_usage.emitted_response_ids.contains(&response_id) {
+            return Ok(());
+        }
+        let Some(timestamp) = codex_session_timestamp(value.timestamp.as_ref()) else {
+            return Ok(());
+        };
+        let Some(raw_usage) = payload.usage.map(normalize_codex_raw_usage) else {
+            return Ok(());
+        };
+        if raw_usage.input_tokens == 0
+            && raw_usage.cached_input_tokens == 0
+            && raw_usage.cache_creation_tokens == 0
+            && raw_usage.output_tokens == 0
+            && raw_usage.reasoning_output_tokens == 0
+            && raw_usage.total_tokens == 0
+        {
+            return Ok(());
+        }
+
+        let parsed_model = codex_model_from_payload(payload);
+        let model_was_inferred = parsed_model.is_none();
+        let (model, is_fallback_model) = resolve_codex_usage_model(
+            parsed_model,
+            &timestamp,
+            current_model,
+            current_model_is_fallback,
+        );
+        let event = CodexTokenUsageEvent {
+            session_id: session_id.to_string(),
+            response_id: Some(response_id.clone()),
+            timestamp,
+            model,
+            input_tokens: raw_usage.input_tokens,
+            cached_input_tokens: raw_usage.cached_input_tokens,
+            cache_creation_tokens: raw_usage.cache_creation_tokens,
+            output_tokens: raw_usage.output_tokens,
+            reasoning_output_tokens: raw_usage.reasoning_output_tokens,
+            total_tokens: raw_usage.total_tokens,
+            is_fallback_model: is_fallback_model || model_was_inferred,
+            service_tier: *current_service_tier,
+        };
+
+        if compaction_usage
+            .compacted_response_ids
+            .contains(&response_id)
+        {
+            if compaction_usage.emitted_response_ids.insert(response_id) {
+                visit(event)?;
+            }
+        } else {
+            compaction_usage
+                .pending_usage
+                .entry(response_id)
+                .or_insert(event);
+        }
+        return Ok(());
+    }
     if entry_type == Some("turn_context") {
         if let Some(model) = value.payload.as_ref().and_then(codex_model_from_payload) {
             *current_model = Some(model);
@@ -357,6 +463,7 @@ fn visit_codex_session_entry(
 
     visit(CodexTokenUsageEvent {
         session_id: session_id.to_string(),
+        response_id: None,
         timestamp,
         model,
         input_tokens: raw_usage.input_tokens,
@@ -448,6 +555,7 @@ fn visit_codex_exec_usage_event(
     );
     visit(CodexTokenUsageEvent {
         session_id: session_id.to_string(),
+        response_id: None,
         timestamp: timestamps.event,
         model,
         input_tokens: raw_usage.input_tokens,
@@ -480,6 +588,8 @@ fn codex_line_usage_kind(line: &[u8]) -> Option<CodexLineKind> {
     if TURN_CONTEXT_TYPE_FINDER.find(line).is_some()
         || has_token_count
         || has_thread_settings_applied
+        || TOKEN_USAGE_RECORD_TYPE_FINDER.find(line).is_some()
+        || COMPACTED_TYPE_FINDER.find(line).is_some()
     {
         return Some(CodexLineKind::Session);
     }
@@ -497,9 +607,19 @@ fn codex_line_usage_kind(line: &[u8]) -> Option<CodexLineKind> {
         || has_nested_thread_settings_applied
         || !has_compact_type
     {
-        let (has_turn_context, has_event_msg, has_token_count, has_thread_settings_applied) =
-            codex_line_type_flags(line);
-        if has_turn_context || (has_event_msg && (has_token_count || has_thread_settings_applied)) {
+        let (
+            has_turn_context,
+            has_event_msg,
+            has_token_count,
+            has_thread_settings_applied,
+            has_token_usage_record,
+            has_compacted,
+        ) = codex_line_type_flags(line);
+        if has_turn_context
+            || has_token_usage_record
+            || has_compacted
+            || (has_event_msg && (has_token_count || has_thread_settings_applied))
+        {
             return Some(CodexLineKind::Session);
         }
     }
@@ -512,12 +632,14 @@ fn codex_line_usage_kind(line: &[u8]) -> Option<CodexLineKind> {
     None
 }
 
-fn codex_line_type_flags(line: &[u8]) -> (bool, bool, bool, bool) {
+fn codex_line_type_flags(line: &[u8]) -> (bool, bool, bool, bool, bool, bool) {
     let mut start = 0;
     let mut has_turn_context = false;
     let mut has_event_msg = false;
     let mut has_token_count = false;
     let mut has_thread_settings_applied = false;
+    let mut has_token_usage_record = false;
+    let mut has_compacted = false;
     while let Some(index) = TYPE_KEY_FINDER.find(&line[start..]) {
         let key_start = start + index;
         let mut cursor = skip_json_whitespace(line, key_start + br#""type""#.len());
@@ -536,12 +658,20 @@ fn codex_line_type_flags(line: &[u8]) -> (bool, bool, bool, bool) {
         has_token_count |= json_string_value_matches(line, cursor, b"token_count");
         has_thread_settings_applied |=
             json_string_value_matches(line, cursor, b"thread_settings_applied");
-        if has_turn_context || (has_event_msg && (has_token_count || has_thread_settings_applied)) {
+        has_token_usage_record |= json_string_value_matches(line, cursor, b"token_usage_record");
+        has_compacted |= json_string_value_matches(line, cursor, b"compacted");
+        if has_turn_context
+            || has_token_usage_record
+            || has_compacted
+            || (has_event_msg && (has_token_count || has_thread_settings_applied))
+        {
             return (
                 has_turn_context,
                 has_event_msg,
                 has_token_count,
                 has_thread_settings_applied,
+                has_token_usage_record,
+                has_compacted,
             );
         }
         start = cursor.saturating_add(1);
@@ -551,6 +681,8 @@ fn codex_line_type_flags(line: &[u8]) -> (bool, bool, bool, bool) {
         has_event_msg,
         has_token_count,
         has_thread_settings_applied,
+        has_token_usage_record,
+        has_compacted,
     )
 }
 
@@ -1104,6 +1236,8 @@ fn normalize_codex_raw_usage(mut usage: CodexRawUsage) -> CodexRawUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ccusage_test_support::fs_fixture;
+    use serde_json::json;
 
     #[test]
     fn maps_recorded_service_tier_spellings() {
@@ -1128,6 +1262,20 @@ mod tests {
         for line in [
             br#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"service_tier":"priority"}}}"#.as_slice(),
             br#"{ "type": "event_msg", "payload": { "type": "thread_settings_applied", "thread_settings": { "service_tier": "default" } } }"#.as_slice(),
+        ] {
+            assert!(matches!(
+                codex_line_usage_kind(line),
+                Some(CodexLineKind::Session)
+            ));
+        }
+    }
+
+    #[test]
+    fn recognizes_compaction_usage_lines_with_json_whitespace() {
+        for line in [
+            br#"{"type":"token_usage_record","payload":{}}"#.as_slice(),
+            br#"{ "type" : "token_usage_record", "payload" : {} }"#.as_slice(),
+            br#"{ "type" : "compacted", "payload" : {} }"#.as_slice(),
         ] {
             assert!(matches!(
                 codex_line_usage_kind(line),
@@ -1190,5 +1338,95 @@ mod tests {
         assert_eq!(series_change.input_tokens, 10);
         assert_eq!(series_change.cached_input_tokens, 0);
         assert_eq!(series_change.cache_creation_tokens, 10);
+    }
+
+    #[test]
+    fn counts_only_usage_records_linked_to_compaction_events() {
+        let token_count = |timestamp: &str| {
+            json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 80,
+                            "output_tokens": 20,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 120,
+                        },
+                    },
+                },
+            })
+            .to_string()
+        };
+        let token_usage_record = |timestamp: &str, response_id: &str, input_tokens: u64| {
+            json!({
+                "timestamp": timestamp,
+                "type": "token_usage_record",
+                "payload": {
+                    "response_id": response_id,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": input_tokens - 20,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": input_tokens + 20,
+                    },
+                },
+            })
+            .to_string()
+        };
+        let fixture = fs_fixture!({
+            "session.jsonl": [
+                json!({
+                    "timestamp": "2026-09-01T00:00:00.000Z",
+                    "type": "turn_context",
+                    "payload": { "model": "gpt-reserve" },
+                })
+                .to_string(),
+                token_count("2026-09-01T00:00:01.000Z"),
+                token_usage_record("2026-09-01T00:00:02.000Z", "compact-before", 300),
+                json!({
+                    "timestamp": "2026-09-01T00:00:03.000Z",
+                    "type": "compacted",
+                    "payload": { "compaction_response_id": "compact-before" },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-09-01T00:00:04.000Z",
+                    "type": "compacted",
+                    "payload": { "compaction_response_id": "compact-before" },
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-09-01T00:00:05.000Z",
+                    "type": "compacted",
+                    "payload": { "compaction_response_id": "compact-after" },
+                })
+                .to_string(),
+                token_usage_record("2026-09-01T00:00:06.000Z", "compact-after", 200),
+                token_usage_record("2026-09-01T00:00:07.000Z", "not-a-compaction", 500),
+                token_count("2026-09-01T00:00:08.000Z"),
+            ]
+            .join("\n"),
+        });
+
+        let events = crate::load_codex_events_from_directory(fixture.root(), true).unwrap();
+
+        assert_eq!(events.len(), 3);
+        let compacted_usages = events
+            .iter()
+            .filter(|event| event.input_tokens > 100)
+            .collect::<Vec<_>>();
+        assert_eq!(compacted_usages.len(), 2);
+        assert_eq!(compacted_usages[0].input_tokens, 300);
+        assert_eq!(compacted_usages[0].cached_input_tokens, 280);
+        assert_eq!(compacted_usages[0].output_tokens, 20);
+        assert_eq!(compacted_usages[0].total_tokens, 320);
+        assert_eq!(compacted_usages[0].model.as_deref(), Some("gpt-reserve"));
+        assert!(compacted_usages[0].is_fallback_model);
+        assert_eq!(compacted_usages[1].input_tokens, 200);
     }
 }

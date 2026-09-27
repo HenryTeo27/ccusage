@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -24,7 +24,9 @@ use super::{parser, paths, replay::CodexReplayPlan};
 struct CodexEventKey {
     session_hash: u64,
     session_len: usize,
-    timestamp: crate::TimestampMs,
+    response_id_hash: u64,
+    response_id_len: usize,
+    timestamp: Option<crate::TimestampMs>,
     model_hash: u64,
     model_len: usize,
     input_tokens: u64,
@@ -39,6 +41,8 @@ struct CodexDedupeRecord {
     service_tier: Option<CodexServiceTier>,
     model: CompactString,
     session_id: Option<CompactString>,
+    timestamp: crate::TimestampMs,
+    usage: CodexUsageBucket,
 }
 
 type CodexDedupeMap = FxHashMap<CodexEventKey, CodexDedupeRecord>;
@@ -307,7 +311,14 @@ fn add_event_to_groups_local(
     let timestamp = parse_ts_timestamp(&event.timestamp)
         .ok_or_else(|| crate::cli_error(format!("Invalid Codex timestamp: {}", event.timestamp)))?;
     let key = codex_event_key(event, timestamp, model.as_ref(), kind);
-    if !insert_dedupe_record(&mut aggregation.seen, key, event, model.as_ref(), kind) {
+    if !insert_dedupe_record(
+        &mut aggregation.seen,
+        key,
+        event,
+        model.as_ref(),
+        kind,
+        timestamp,
+    ) {
         return Ok(());
     }
     add_deduped_event_to_groups(
@@ -533,12 +544,12 @@ fn apply_recorded_usage_entries<'a>(
     kind: AgentReportKind,
 ) {
     let timezone = parse_tz(shared.timezone.as_deref()).or_else(|| Some(JiffTimeZone::system()));
-    for (key, record) in records {
+    for (_, record) in records {
         let Some(service_tier) = record.service_tier else {
             continue;
         };
         let Some(period) = codex_period_for(
-            key.timestamp,
+            record.timestamp,
             record.session_id.as_deref(),
             kind,
             timezone.as_ref(),
@@ -552,36 +563,12 @@ fn apply_recorded_usage_entries<'a>(
         let Some(model_usage) = group.models.get_mut(record.model.as_str()) else {
             continue;
         };
-        let is_long_context =
-            key.input_tokens > crate::pricing::long_context_split_threshold(record.model.as_str());
-        let usage = CodexUsageBucket {
-            input_tokens: key.input_tokens,
-            cached_input_tokens: key.cached_input_tokens,
-            cache_creation_tokens: key.cache_creation_tokens,
-            output_tokens: key.output_tokens,
-            long_context_input_tokens: if is_long_context { key.input_tokens } else { 0 },
-            long_context_cached_input_tokens: if is_long_context {
-                key.cached_input_tokens
-            } else {
-                0
-            },
-            long_context_cache_creation_tokens: if is_long_context {
-                key.cache_creation_tokens
-            } else {
-                0
-            },
-            long_context_output_tokens: if is_long_context {
-                key.output_tokens
-            } else {
-                0
-            },
-        };
         merge_recorded_codex_usage(
             model_usage,
             record.model.as_str(),
-            key.timestamp,
+            record.timestamp,
             service_tier,
-            usage,
+            record.usage,
         );
     }
 }
@@ -612,6 +599,7 @@ fn insert_event_key(
         event,
         model,
         kind,
+        timestamp,
     )
 }
 
@@ -621,6 +609,7 @@ fn insert_dedupe_record(
     event: &CodexTokenUsageEvent,
     model: &str,
     kind: AgentReportKind,
+    timestamp: crate::TimestampMs,
 ) -> bool {
     if let Some(record) = seen.get_mut(&key) {
         record.service_tier = merge_codex_service_tiers(record.service_tier, event.service_tier);
@@ -633,6 +622,8 @@ fn insert_dedupe_record(
             model: CompactString::new(model),
             session_id: (kind == AgentReportKind::Session)
                 .then(|| CompactString::new(&event.session_id)),
+            timestamp,
+            usage: codex_usage_bucket(event, model),
         },
     );
     true
@@ -644,23 +635,83 @@ fn codex_event_key(
     model: &str,
     kind: AgentReportKind,
 ) -> CodexEventKey {
-    let (session_hash, session_len) = if kind == AgentReportKind::Session {
+    let has_response_id = event.response_id.is_some();
+    let (session_hash, session_len) = if !has_response_id && kind == AgentReportKind::Session {
         (hash_text(&event.session_id), event.session_id.len())
     } else {
         (0, 0)
     };
+    let (response_id_hash, response_id_len) = event.response_id.as_deref().map_or((0, 0), |id| {
+        (hash_text(id), id.len())
+    });
     CodexEventKey {
         session_hash,
         session_len,
-        timestamp,
-        model_hash: hash_text(model),
-        model_len: model.len(),
+        response_id_hash,
+        response_id_len,
+        timestamp: (!has_response_id).then_some(timestamp),
+        model_hash: if has_response_id {
+            0
+        } else {
+            hash_text(model)
+        },
+        model_len: if has_response_id {
+            0
+        } else {
+            model.len()
+        },
+        input_tokens: if has_response_id {
+            0
+        } else {
+            event.input_tokens
+        },
+        cached_input_tokens: if has_response_id {
+            0
+        } else {
+            event.cached_input_tokens
+        },
+        cache_creation_tokens: if has_response_id {
+            0
+        } else {
+            event.cache_creation_tokens
+        },
+        output_tokens: if has_response_id {
+            0
+        } else {
+            event.output_tokens
+        },
+        reasoning_output_tokens: if has_response_id {
+            0
+        } else {
+            event.reasoning_output_tokens
+        },
+        total_tokens: if has_response_id { 0 } else { event.total_tokens },
+    }
+}
+
+fn codex_usage_bucket(event: &CodexTokenUsageEvent, model: &str) -> CodexUsageBucket {
+    let is_long_context = event.input_tokens > crate::pricing::long_context_split_threshold(model);
+    CodexUsageBucket {
         input_tokens: event.input_tokens,
         cached_input_tokens: event.cached_input_tokens,
         cache_creation_tokens: event.cache_creation_tokens,
         output_tokens: event.output_tokens,
-        reasoning_output_tokens: event.reasoning_output_tokens,
-        total_tokens: event.total_tokens,
+        long_context_input_tokens: if is_long_context { event.input_tokens } else { 0 },
+        long_context_cached_input_tokens: if is_long_context {
+            event.cached_input_tokens
+        } else {
+            0
+        },
+        long_context_cache_creation_tokens: if is_long_context {
+            event.cache_creation_tokens
+        } else {
+            0
+        },
+        long_context_output_tokens: if is_long_context {
+            event.output_tokens
+        } else {
+            0
+        },
     }
 }
 
@@ -731,11 +782,17 @@ pub fn aggregate_events(
     timezone: Option<&str>,
 ) -> Result<BTreeMap<String, CodexGroup>> {
     let mut groups = BTreeMap::new();
+    let mut seen_compaction_responses = HashSet::new();
     let timezone = parse_tz(timezone).or_else(|| Some(JiffTimeZone::system()));
     for event in events {
         let Some(model) = event.model.as_deref().filter(|model| !model.is_empty()) else {
             continue;
         };
+        if let Some(response_id) = event.response_id.as_deref()
+            && !seen_compaction_responses.insert(response_id)
+        {
+            continue;
+        }
         let timestamp = parse_ts_timestamp(&event.timestamp).ok_or_else(|| {
             crate::cli_error(format!("Invalid Codex timestamp: {}", event.timestamp))
         })?;
@@ -819,6 +876,7 @@ mod tests {
     fn stores_timestamped_usage_only_for_time_dependent_models() {
         let event = |model: &str| CodexTokenUsageEvent {
             session_id: "session-1".to_string(),
+            response_id: None,
             timestamp: "2026-08-17T01:00:00.000Z".to_string(),
             model: Some(model.to_string()),
             input_tokens: 1_000_000,
@@ -840,6 +898,98 @@ mod tests {
 
         assert!(models["gpt-5"].timestamped_usage.is_empty());
         assert_eq!(models["deepseek-v4-flash"].timestamped_usage.len(), 1);
+    }
+
+    #[test]
+    fn dedupes_compaction_usage_by_response_id_across_models_and_sessions() {
+        let timestamp = parse_ts_timestamp("2026-08-17T01:00:00.000Z").unwrap();
+        let first = CodexTokenUsageEvent {
+            session_id: "session-a".to_string(),
+            response_id: Some("response-1".to_string()),
+            timestamp: "2026-08-17T01:00:00.000Z".to_string(),
+            model: Some("gpt-5.6-luna".to_string()),
+            input_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_000_000,
+            is_fallback_model: true,
+            service_tier: None,
+        };
+        let mut copied = first.clone();
+        copied.session_id = "session-b".to_string();
+        copied.model = Some("gpt-5.6-sol".to_string());
+        copied.timestamp = "2026-08-17T01:01:00.000Z".to_string();
+        copied.input_tokens = 1_100_000;
+        copied.total_tokens = 1_100_000;
+        let copied_timestamp = parse_ts_timestamp(&copied.timestamp).unwrap();
+        let first_key = codex_event_key(
+            &first,
+            timestamp,
+            "gpt-5.6-luna",
+            AgentReportKind::Daily,
+        );
+        let copied_key = codex_event_key(
+            &copied,
+            copied_timestamp,
+            "gpt-5.6-sol",
+            AgentReportKind::Daily,
+        );
+
+        assert_eq!(first_key, copied_key);
+        let mut seen = FxHashMap::default();
+        assert!(insert_dedupe_record(
+            &mut seen,
+            first_key,
+            &first,
+            "gpt-5.6-luna",
+            AgentReportKind::Daily,
+            timestamp,
+        ));
+        assert!(!insert_dedupe_record(
+            &mut seen,
+            copied_key,
+            &copied,
+            "gpt-5.6-sol",
+            AgentReportKind::Daily,
+            copied_timestamp,
+        ));
+        assert_eq!(seen.len(), 1);
+        let retained = seen.values().next().unwrap();
+        assert_eq!(retained.timestamp, timestamp);
+        assert_eq!(retained.usage.input_tokens, 1_000_000);
+    }
+
+    #[test]
+    fn aggregate_events_dedupes_compaction_response_ids() {
+        let first = CodexTokenUsageEvent {
+            session_id: "session-a".to_string(),
+            response_id: Some("response-1".to_string()),
+            timestamp: "2026-08-17T01:00:00.000Z".to_string(),
+            model: Some("gpt-5.6-luna".to_string()),
+            input_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_000_000,
+            is_fallback_model: true,
+            service_tier: None,
+        };
+        let mut copied = first.clone();
+        copied.session_id = "session-b".to_string();
+        copied.model = Some("gpt-5.6-sol".to_string());
+        copied.timestamp = "2026-08-17T01:01:00.000Z".to_string();
+        copied.input_tokens = 1_100_000;
+        copied.total_tokens = 1_100_000;
+
+        let expected_total = first.total_tokens;
+        let groups =
+            aggregate_events(&[first, copied], AgentReportKind::Daily, Some("UTC")).unwrap();
+
+        assert_eq!(groups["2026-08-17"].total_tokens, expected_total);
+        assert_eq!(groups["2026-08-17"].models.len(), 1);
     }
 
     #[test]
