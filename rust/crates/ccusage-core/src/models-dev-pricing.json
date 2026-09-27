@@ -11468,26 +11468,6 @@
 			"context": 1040384
 		}
 	},
-	"fireworks_ai/accounts/fireworks/models/deepseek-v4-flash-0731": {
-		"cost": {
-			"cache_read": 0.007,
-			"input": 0.22,
-			"output": 0.66
-		},
-		"limit": {
-			"context": 1048576
-		}
-	},
-	"fireworks_ai/accounts/fireworks/models/deepseek-v4-pro-0813": {
-		"cost": {
-			"cache_read": 0.044,
-			"input": 1.32,
-			"output": 3.96
-		},
-		"limit": {
-			"context": 1048576
-		}
-	},
 	"fireworks_ai/accounts/fireworks/models/inkling": {
 		"cost": {
 			"cache_read": 0.17,
@@ -11497,16 +11477,6 @@
 		"exactOnly": true,
 		"limit": {
 			"context": 1048576
-		}
-	},
-	"fireworks_ai/accounts/fireworks/models/muse-glimmer-30b": {
-		"cost": {
-			"cache_read": 0.04,
-			"input": 0.35,
-			"output": 1.5
-		},
-		"limit": {
-			"context": 131072
 		}
 	},
 	"fireworks_ai/gpt-oss-120b": {
@@ -14103,24 +14073,6 @@
 		"cost": {
 			"input": 0.04,
 			"output": 0.08
-		},
-		"limit": {
-			"context": 131072
-		}
-	},
-	"google/deep-research-max-preview-04-2026": {
-		"cost": {
-			"input": 2,
-			"output": 12
-		},
-		"limit": {
-			"context": 131072
-		}
-	},
-	"google/deep-research-preview-04-2026": {
-		"cost": {
-			"input": 2,
-			"output": 12
 		},
 		"limit": {
 			"context": 131072
@@ -17746,6 +17698,16 @@
 		},
 		"limit": {
 			"context": 1048756
+		}
+	},
+	"longcat-2.5-preview": {
+		"cost": {
+			"cache_read": 0.015,
+			"input": 0.75,
+			"output": 2.95
+		},
+		"limit": {
+			"context": 1000000
 		}
 	},
 	"lucidnova-rf1-100b": {
@@ -31076,7 +31038,7 @@
 	},
 	"xiaomi/mimo-v2.6-flash-uncensored": {
 		"cost": {
-			"cache_read": 0.00903,
+			"cache_read": 0.1995,
 			"input": 0.5,
 			"output": 1.5
 		},
@@ -31086,7 +31048,7 @@
 	},
 	"xiaomi/mimo-v2.6-flash-uncensored:thinking": {
 		"cost": {
-			"cache_read": 0.00903,
+			"cache_read": 0.1995,
 			"input": 0.5,
 			"output": 1.5
 		},
@@ -31661,7 +31623,7 @@
 	},
 	"z-ai/glm-5.3-flash-uncensored": {
 		"cost": {
-			"cache_read": 0.1,
+			"cache_read": 0.07,
 			"input": 0.2,
 			"output": 0.8
 		},
@@ -32638,9 +32600,9 @@
 	},
 	"~z-ai/glm-latest": {
 		"cost": {
-			"cache_read": 0.0702,
-			"input": 0.378,
-			"output": 1.188
+			"cache_read": 0.06604,
+			"input": 0.3556,
+			"output": 1.1176
 		},
 		"exactOnly": true,
 		"limit": {
