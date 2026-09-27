@@ -993,6 +993,39 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_session_report_attributes_duplicate_response_to_first_session() {
+        let first = CodexTokenUsageEvent {
+            session_id: "session-a".to_string(),
+            response_id: Some("response-1".to_string()),
+            timestamp: "2026-08-17T01:00:00.000Z".to_string(),
+            model: Some("gpt-5.6-luna".to_string()),
+            input_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_000_000,
+            is_fallback_model: true,
+            service_tier: None,
+        };
+        let mut duplicate = first.clone();
+        duplicate.session_id = "session-b".to_string();
+        duplicate.input_tokens = 2_000_000;
+        duplicate.total_tokens = 2_000_000;
+
+        let groups = aggregate_events(
+            &[first, duplicate],
+            AgentReportKind::Session,
+            Some("UTC"),
+        )
+        .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups["session-a"].total_tokens, 1_000_000);
+        assert!(!groups.contains_key("session-b"));
+    }
+
+    #[test]
     fn omits_codex_period_outside_date_bounds() {
         let timezone = parse_tz(Some("UTC")).unwrap();
         let shared = SharedArgs {
